@@ -1,0 +1,27 @@
+# Azure基础配置
+resource_group_name = "devops-demo-rg"
+location           = "East Asia"  # 或 "Southeast Asia"
+
+# 应用配置
+app_name           = "my-devops-demo-app"  # 必须全局唯一
+environment        = "prod"
+app_service_sku    = "B1"
+
+# Docker配置
+docker_image_name     = "devops-demo-api"
+docker_image_tag      = "latest"
+docker_registry_url   = "https://your-registry.azurecr.io"  # 或者使用Azure Container Registry
+docker_registry_username = "your-registry-username"
+docker_registry_password = "your-registry-password"
+
+# 功能开关
+create_staging_slot = true
+
+# 标签
+common_tags = {
+  Project     = "DevOps-Demo"
+  Environment = "Production"
+  ManagedBy   = "Terraform"
+  Owner       = "DevOps-Team"
+  CostCenter  = "Engineering"
+}

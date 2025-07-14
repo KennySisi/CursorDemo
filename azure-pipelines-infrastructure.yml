@@ -1,0 +1,215 @@
+# Infrastructure Pipeline - 用于部署和管理Azure基础设施
+name: Infrastructure-$(Date:yyyyMMdd)-$(Rev:r)
+
+# 触发条件
+trigger:
+  branches:
+    include:
+      - main
+      - develop
+  paths:
+    include:
+      - terraform/*
+      - azure-pipelines-infrastructure.yml
+
+# PR触发条件
+pr:
+  branches:
+    include:
+      - main
+  paths:
+    include:
+      - terraform/*
+
+# 变量
+variables:
+  - group: terraform-variables  # Azure DevOps Variable Group
+  - name: terraformVersion
+    value: '1.6.0'
+  - name: azureServiceConnection
+    value: 'azure-service-connection'  # 需要在Azure DevOps中配置
+  - name: backendResourceGroup
+    value: 'terraform-state-rg'
+  - name: backendStorageAccount
+    value: 'terraformstate$(System.TeamProject)'
+  - name: backendContainerName
+    value: 'tfstate'
+
+# 阶段定义
+stages:
+  # Terraform格式验证和计划阶段
+  - stage: TerraformValidateAndPlan
+    displayName: 'Terraform Validate & Plan'
+    jobs:
+      - job: ValidateAndPlan
+        displayName: 'Validate and Plan Infrastructure'
+        pool:
+          vmImage: 'ubuntu-latest'
+        
+        steps:
+          # 检出代码
+          - checkout: self
+            displayName: 'Checkout Repository'
+          
+          # 安装Terraform
+          - task: TerraformInstaller@0
+            displayName: 'Install Terraform'
+            inputs:
+              terraformVersion: $(terraformVersion)
+          
+          # 初始化Terraform
+          - task: TerraformTaskV4@4
+            displayName: 'Terraform Init'
+            inputs:
+              provider: 'azurerm'
+              command: 'init'
+              workingDirectory: '$(System.DefaultWorkingDirectory)/terraform'
+              backendServiceArm: $(azureServiceConnection)
+              backendAzureRmResourceGroupName: $(backendResourceGroup)
+              backendAzureRmStorageAccountName: $(backendStorageAccount)
+              backendAzureRmContainerName: $(backendContainerName)
+              backendAzureRmKey: 'devops-demo.terraform.tfstate'
+          
+          # Terraform格式检查
+          - task: TerraformTaskV4@4
+            displayName: 'Terraform Format Check'
+            inputs:
+              provider: 'azurerm'
+              command: 'custom'
+              workingDirectory: '$(System.DefaultWorkingDirectory)/terraform'
+              customCommand: 'fmt'
+              commandOptions: '-check -recursive'
+          
+          # Terraform验证
+          - task: TerraformTaskV4@4
+            displayName: 'Terraform Validate'
+            inputs:
+              provider: 'azurerm'
+              command: 'validate'
+              workingDirectory: '$(System.DefaultWorkingDirectory)/terraform'
+          
+          # Terraform计划
+          - task: TerraformTaskV4@4
+            displayName: 'Terraform Plan'
+            inputs:
+              provider: 'azurerm'
+              command: 'plan'
+              workingDirectory: '$(System.DefaultWorkingDirectory)/terraform'
+              environmentServiceNameAzureRM: $(azureServiceConnection)
+              commandOptions: '-var-file="terraform.tfvars" -out=tfplan'
+          
+          # 发布Terraform计划文件
+          - task: PublishPipelineArtifact@1
+            displayName: 'Publish Terraform Plan'
+            inputs:
+              targetPath: '$(System.DefaultWorkingDirectory)/terraform'
+              artifact: 'terraform-plan'
+              publishLocation: 'pipeline'
+
+  # Terraform应用阶段（仅在main分支）
+  - stage: TerraformApply
+    displayName: 'Terraform Apply'
+    dependsOn: TerraformValidateAndPlan
+    condition: and(succeeded(), eq(variables['Build.SourceBranch'], 'refs/heads/main'))
+    jobs:
+      - deployment: ApplyInfrastructure
+        displayName: 'Apply Infrastructure Changes'
+        pool:
+          vmImage: 'ubuntu-latest'
+        environment: 'production'  # 需要在Azure DevOps中创建环境
+        strategy:
+          runOnce:
+            deploy:
+              steps:
+                # 下载Terraform计划
+                - task: DownloadPipelineArtifact@2
+                  displayName: 'Download Terraform Plan'
+                  inputs:
+                    artifactName: 'terraform-plan'
+                    downloadPath: '$(System.DefaultWorkingDirectory)/terraform'
+                
+                # 安装Terraform
+                - task: TerraformInstaller@0
+                  displayName: 'Install Terraform'
+                  inputs:
+                    terraformVersion: $(terraformVersion)
+                
+                # 重新初始化Terraform
+                - task: TerraformTaskV4@4
+                  displayName: 'Terraform Init'
+                  inputs:
+                    provider: 'azurerm'
+                    command: 'init'
+                    workingDirectory: '$(System.DefaultWorkingDirectory)/terraform'
+                    backendServiceArm: $(azureServiceConnection)
+                    backendAzureRmResourceGroupName: $(backendResourceGroup)
+                    backendAzureRmStorageAccountName: $(backendStorageAccount)
+                    backendAzureRmContainerName: $(backendContainerName)
+                    backendAzureRmKey: 'devops-demo.terraform.tfstate'
+                
+                # 应用Terraform更改
+                - task: TerraformTaskV4@4
+                  displayName: 'Terraform Apply'
+                  inputs:
+                    provider: 'azurerm'
+                    command: 'apply'
+                    workingDirectory: '$(System.DefaultWorkingDirectory)/terraform'
+                    environmentServiceNameAzureRM: $(azureServiceConnection)
+                    commandOptions: 'tfplan'
+                
+                # 获取输出
+                - task: TerraformTaskV4@4
+                  displayName: 'Terraform Output'
+                  inputs:
+                    provider: 'azurerm'
+                    command: 'output'
+                    workingDirectory: '$(System.DefaultWorkingDirectory)/terraform'
+                    environmentServiceNameAzureRM: $(azureServiceConnection)
+
+  # 销毁阶段（手动触发）
+  - stage: TerraformDestroy
+    displayName: 'Terraform Destroy'
+    dependsOn: []
+    condition: and(always(), eq(variables['Build.Reason'], 'Manual'))
+    jobs:
+      - deployment: DestroyInfrastructure
+        displayName: 'Destroy Infrastructure'
+        pool:
+          vmImage: 'ubuntu-latest'
+        environment: 'production-destroy'  # 需要特殊审批的环境
+        strategy:
+          runOnce:
+            deploy:
+              steps:
+                # 检出代码
+                - checkout: self
+                  displayName: 'Checkout Repository'
+                
+                # 安装Terraform
+                - task: TerraformInstaller@0
+                  displayName: 'Install Terraform'
+                  inputs:
+                    terraformVersion: $(terraformVersion)
+                
+                # 初始化Terraform
+                - task: TerraformTaskV4@4
+                  displayName: 'Terraform Init'
+                  inputs:
+                    provider: 'azurerm'
+                    command: 'init'
+                    workingDirectory: '$(System.DefaultWorkingDirectory)/terraform'
+                    backendServiceArm: $(azureServiceConnection)
+                    backendAzureRmResourceGroupName: $(backendResourceGroup)
+                    backendAzureRmStorageAccountName: $(backendStorageAccount)
+                    backendAzureRmContainerName: $(backendContainerName)
+                    backendAzureRmKey: 'devops-demo.terraform.tfstate'
+                
+                # 销毁基础设施
+                - task: TerraformTaskV4@4
+                  displayName: 'Terraform Destroy'
+                  inputs:
+                    provider: 'azurerm'
+                    command: 'destroy'
+                    workingDirectory: '$(System.DefaultWorkingDirectory)/terraform'
+                    environmentServiceNameAzureRM: $(azureServiceConnection)
+                    commandOptions: '-var-file="terraform.tfvars" -auto-approve'
