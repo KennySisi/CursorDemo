@@ -1,0 +1,266 @@
+# Application CI/CD Pipeline
+name: Application-$(Date:yyyyMMdd)-$(Rev:r)
+
+# 触发条件
+trigger:
+  branches:
+    include:
+      - main
+      - develop
+      - feature/*
+  paths:
+    exclude:
+      - terraform/*
+      - README.md
+      - docs/*
+
+# PR触发条件
+pr:
+  branches:
+    include:
+      - main
+      - develop
+  paths:
+    exclude:
+      - terraform/*
+      - README.md
+      - docs/*
+
+# 变量
+variables:
+  - group: application-variables  # Azure DevOps Variable Group
+  - name: pythonVersion
+    value: '3.11'
+  - name: dockerRegistryServiceConnection
+    value: 'docker-registry-connection'  # Docker registry service connection
+  - name: imageRepository
+    value: 'devops-demo-api'
+  - name: dockerfilePath
+    value: '$(Build.SourcesDirectory)/Dockerfile'
+  - name: tag
+    value: '$(Build.BuildId)'
+  - name: azureServiceConnection
+    value: 'azure-service-connection'
+
+# 阶段定义
+stages:
+  # CI阶段 - 代码检查、测试、构建
+  - stage: CI
+    displayName: 'Continuous Integration'
+    jobs:
+      - job: CodeQuality
+        displayName: 'Code Quality & Testing'
+        pool:
+          vmImage: 'ubuntu-latest'
+        
+        steps:
+          # 检出代码
+          - checkout: self
+            displayName: 'Checkout Repository'
+          
+          # 设置Python环境
+          - task: UsePythonVersion@0
+            displayName: 'Setup Python $(pythonVersion)'
+            inputs:
+              versionSpec: $(pythonVersion)
+          
+          # 安装Python依赖
+          - script: |
+              python -m pip install --upgrade pip
+              pip install -r requirements.txt
+            displayName: 'Install Python Dependencies'
+          
+          # 代码格式检查
+          - script: |
+              black --check app/ tests/
+            displayName: 'Code Format Check (Black)'
+            continueOnError: true
+          
+          # 代码质量检查
+          - script: |
+              flake8 app/ tests/ --max-line-length=88 --extend-ignore=E203,W503
+            displayName: 'Code Quality Check (Flake8)'
+            continueOnError: true
+          
+          # 类型检查
+          - script: |
+              mypy app/ --ignore-missing-imports
+            displayName: 'Type Check (MyPy)'
+            continueOnError: true
+          
+          # 运行单元测试
+          - script: |
+              pytest tests/ -v --junitxml=test-results.xml --cov=app --cov-report=xml --cov-report=html
+            displayName: 'Run Unit Tests'
+          
+          # 发布测试结果
+          - task: PublishTestResults@2
+            displayName: 'Publish Test Results'
+            condition: succeededOrFailed()
+            inputs:
+              testResultsFormat: 'JUnit'
+              testResultsFiles: 'test-results.xml'
+              failTaskOnFailedTests: true
+          
+          # 发布代码覆盖率
+          - task: PublishCodeCoverageResults@1
+            displayName: 'Publish Code Coverage'
+            inputs:
+              codeCoverageTool: 'Cobertura'
+              summaryFileLocation: 'coverage.xml'
+              reportDirectory: 'htmlcov'
+          
+          # 创建Python包
+          - script: |
+              python setup.py sdist bdist_wheel
+            displayName: 'Build Python Package'
+            condition: and(succeeded(), eq(variables['Build.SourceBranch'], 'refs/heads/main'))
+          
+          # 发布Python包到Azure Artifacts
+          - task: TwineAuthenticate@1
+            displayName: 'Authenticate with Azure Artifacts'
+            condition: and(succeeded(), eq(variables['Build.SourceBranch'], 'refs/heads/main'))
+            inputs:
+              artifactFeed: 'devops-demo-feed'  # 需要在Azure DevOps中创建
+          
+          - script: |
+              python -m twine upload -r devops-demo-feed --config-file $(PYPIRC_PATH) dist/*
+            displayName: 'Upload Python Package'
+            condition: and(succeeded(), eq(variables['Build.SourceBranch'], 'refs/heads/main'))
+
+      # Docker镜像构建
+      - job: BuildDockerImage
+        displayName: 'Build Docker Image'
+        dependsOn: CodeQuality
+        condition: succeeded()
+        pool:
+          vmImage: 'ubuntu-latest'
+        
+        steps:
+          # 检出代码
+          - checkout: self
+            displayName: 'Checkout Repository'
+          
+          # 构建Docker镜像
+          - task: Docker@2
+            displayName: 'Build Docker Image'
+            inputs:
+              containerRegistry: $(dockerRegistryServiceConnection)
+              repository: $(imageRepository)
+              command: 'build'
+              Dockerfile: $(dockerfilePath)
+              tags: |
+                $(tag)
+                latest
+          
+          # 运行Docker安全扫描
+          - script: |
+              docker run --rm -v /var/run/docker.sock:/var/run/docker.sock \
+                -v $(pwd):/root/.cache/ aquasec/trivy:latest image \
+                --exit-code 0 --severity HIGH,CRITICAL \
+                --format json -o trivy-results.json \
+                $(imageRepository):$(tag)
+            displayName: 'Docker Security Scan'
+            continueOnError: true
+          
+          # 推送Docker镜像
+          - task: Docker@2
+            displayName: 'Push Docker Image'
+            condition: and(succeeded(), in(variables['Build.SourceBranch'], 'refs/heads/main', 'refs/heads/develop'))
+            inputs:
+              containerRegistry: $(dockerRegistryServiceConnection)
+              repository: $(imageRepository)
+              command: 'push'
+              tags: |
+                $(tag)
+                latest
+
+  # 部署到Staging环境
+  - stage: DeployStaging
+    displayName: 'Deploy to Staging'
+    dependsOn: CI
+    condition: and(succeeded(), eq(variables['Build.SourceBranch'], 'refs/heads/develop'))
+    jobs:
+      - deployment: DeployToStaging
+        displayName: 'Deploy to Staging Environment'
+        pool:
+          vmImage: 'ubuntu-latest'
+        environment: 'staging'  # 需要在Azure DevOps中创建环境
+        strategy:
+          runOnce:
+            deploy:
+              steps:
+                # 部署到Azure App Service Staging Slot
+                - task: AzureWebAppContainer@1
+                  displayName: 'Deploy to Azure App Service Staging'
+                  inputs:
+                    azureSubscription: $(azureServiceConnection)
+                    appName: '$(webAppName)'  # 从variable group获取
+                    slotName: 'staging'
+                    containers: '$(imageRepository):$(tag)'
+                
+                # 运行健康检查
+                - script: |
+                    echo "Waiting for application to start..."
+                    sleep 30
+                    curl -f https://$(webAppName)-staging.azurewebsites.net/health
+                  displayName: 'Health Check'
+                
+                # 运行烟雾测试
+                - script: |
+                    pytest tests/smoke_tests.py --base-url=https://$(webAppName)-staging.azurewebsites.net
+                  displayName: 'Smoke Tests'
+
+  # 部署到生产环境
+  - stage: DeployProduction
+    displayName: 'Deploy to Production'
+    dependsOn: CI
+    condition: and(succeeded(), eq(variables['Build.SourceBranch'], 'refs/heads/main'))
+    jobs:
+      - deployment: DeployToProduction
+        displayName: 'Deploy to Production Environment'
+        pool:
+          vmImage: 'ubuntu-latest'
+        environment: 'production'  # 需要在Azure DevOps中创建环境，并配置审批
+        strategy:
+          runOnce:
+            deploy:
+              steps:
+                # 部署到Azure App Service
+                - task: AzureWebAppContainer@1
+                  displayName: 'Deploy to Azure App Service Production'
+                  inputs:
+                    azureSubscription: $(azureServiceConnection)
+                    appName: '$(webAppName)'
+                    containers: '$(imageRepository):$(tag)'
+                
+                # 等待应用启动
+                - script: |
+                    echo "Waiting for application to start..."
+                    sleep 30
+                  displayName: 'Wait for Application Startup'
+                
+                # 运行健康检查
+                - script: |
+                    curl -f https://$(webAppName).azurewebsites.net/health
+                  displayName: 'Production Health Check'
+                
+                # 运行生产环境测试
+                - script: |
+                    pytest tests/production_tests.py --base-url=https://$(webAppName).azurewebsites.net
+                  displayName: 'Production Tests'
+                
+                # 发送部署通知
+                - task: PublishToAzureServiceBus@1
+                  displayName: 'Send Deployment Notification'
+                  condition: always()
+                  inputs:
+                    azureSubscription: $(azureServiceConnection)
+                    messageBody: |
+                      {
+                        "deployment": "production",
+                        "version": "$(tag)",
+                        "status": "$(Agent.JobStatus)",
+                        "url": "https://$(webAppName).azurewebsites.net",
+                        "timestamp": "$(System.DateTime)"
+                      }

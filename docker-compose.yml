@@ -1,0 +1,60 @@
+version: '3.8'
+
+services:
+  # FastAPI应用
+  api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    ports:
+      - "8000:8000"
+    environment:
+      - ENVIRONMENT=development
+      - PYTHONPATH=/app
+    volumes:
+      - ./app:/app/app
+      - ./tests:/app/tests
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 40s
+    
+  # 可选：Redis缓存服务
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "6379:6379"
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+    
+  # 可选：PostgreSQL数据库
+  postgres:
+    image: postgres:15-alpine
+    environment:
+      POSTGRES_DB: devops_demo
+      POSTGRES_USER: devops
+      POSTGRES_PASSWORD: demo123
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U devops"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+volumes:
+  postgres_data:
+
+networks:
+  default:
+    name: devops-demo-network
